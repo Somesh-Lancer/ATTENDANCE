@@ -236,7 +236,7 @@ def compare_files(att_bytes, bio1_bytes, bio2_bytes):
 # Streamlit UI
 # ======================================================
 st.set_page_config(page_title="Attendance Comparator (All Shifts)", page_icon="🕒", layout="centered")
-st.title("🕒 Attendance Comparator — ±15 min IN/OUT Logic for All Shifts")
+st.title("🕒 Attendance Comparator")
 st.markdown("""
 ✅ **IN Punch** valid if within *15 min before or after* shift start.  
 ✅ **OUT Punch** valid if within *15 min before or after* shift end.  
@@ -267,3 +267,4 @@ if st.button("🔍 Compare Files"):
                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
                 st.dataframe(df.head(20))
+
