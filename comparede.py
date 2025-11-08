@@ -24,7 +24,8 @@ def to_time(v):
 
 def find_emp_col(df):
     for c in df.columns:
-        if any(k in str(c).lower() for k in ["pay code","emp code","empid","emp id","employee code","code"]):
+        if any(k in str(c).lower() for k in
+               ["pay code","emp code","empid","emp id","employee code","code"]):
             return c
     return df.columns[0]
 
@@ -46,16 +47,12 @@ def get_punch_times(df, emp, id_col):
 
 # ---------- Shift Windows ----------
 SHIFT = {
-    "day":       {"in_start": time(6,45), "in_end": time(7,30),
-                  "out_start": time(15,0), "out_end": time(15,45)},
-    "hn":        {"in_start": time(14,45), "in_end": time(15,30),
-                  "out_start": time(23,0),  "out_end": time(23,45)},
-    "fn":        {"in_start": time(23,0),  "in_end": time(23,30),
-                  "out_start": time(6,45),  "out_end": time(7,30)},
     "general1":  {"in_start": time(7,30),  "in_end": time(8,15),
                   "out_start": time(15,30), "out_end": time(16,15)},
     "general2":  {"in_start": time(8,30),  "in_end": time(9,15),
                   "out_start": time(16,30), "out_end": time(17,45)},
+    "fn":        {"in_start": time(23,0),  "in_end": time(23,30),
+                  "out_start": time(6,45),  "out_end": time(7,30)},
 }
 
 # ---------- Core ----------
@@ -76,10 +73,12 @@ def compare_files(att_bytes,bio1_bytes,bio2_bytes=None):
     date_col=next((c for c in att_df.columns if "date" in c.lower()),None)
     if date_col: att_df[date_col]=pd.to_datetime(att_df[date_col],errors="coerce")
 
-    # Biometric files
+    # Biometric File 1 (mandatory)
     bio1_path = tmpcopy(bio1_bytes)
     bio1 = dedupe(pd.read_excel(bio1_path, skiprows=1))
     bio1.columns = bio1.columns.str.strip()
+
+    # Biometric File 2 (optional)
     bio2=None
     if bio2_bytes:
         bio2_path = tmpcopy(bio2_bytes)
@@ -94,11 +93,12 @@ def compare_files(att_bytes,bio1_bytes,bio2_bytes=None):
     bio1[b_emp1]=bio1[b_emp1].astype(str).map(clean_id)
     if bio2 is not None: bio2[b_emp2]=bio2[b_emp2].astype(str).map(clean_id)
 
+    # Filter to only matching employees
     all_emps=set(bio1[b_emp1])
     if bio2 is not None: all_emps|=set(bio2[b_emp2])
     att_df=att_df[att_df[m_emp].isin(all_emps)].reset_index(drop=True)
 
-    # ---- helpers ----
+    # --- Helpers ---
     def get_ot_hours(row):
         for c in att_df.columns:
             if "overtime" in c.lower():
@@ -107,12 +107,6 @@ def compare_files(att_bytes,bio1_bytes,bio2_bytes=None):
                     try: return float(v)
                     except: return None
         return None
-
-    def pick_by_window(punches, window):
-        """Return the punch that falls within the window."""
-        if not punches: return None
-        valid=[p for p in punches if window[0] <= p.time() <= window[1]]
-        return valid[0] if valid else None
 
     results=[]
     shift_col=next((c for c in att_df.columns if "shift" in c.lower()),"SHIFT")
@@ -125,152 +119,109 @@ def compare_files(att_bytes,bio1_bytes,bio2_bytes=None):
         status="No Punch"
         ot_val=get_ot_hours(row)
 
-        # ----- DAY -----
-        if "day" in shift:
-            s=SHIFT["day"]
-            if not p1: status="No Punch"
+        # ---------- GENERAL-1 ----------
+        if any(x in shift for x in ["general1","general 1"]):
+            s=SHIFT["general1"]
+            if not p1:
+                status="No Punch"
             elif len(p1)==1:
                 t=p1[0].time()
-                status="Single In Punch" if t<s["out_start"] else "Single Out Punch"
+                status="Single In Punch" if t < s["out_start"] else "Single Out Punch"
             else:
-                in_p = pick_by_window(p1, (s["in_start"], s["in_end"]))
-                out_p = pick_by_window(p1, (s["out_start"], s["out_end"]))
-                if not in_p or not out_p:
-                    status="Mismatch"
-                else:
-                    if out_p < in_p: out_p = out_p + timedelta(days=1)
-                    actual_min = (out_p - in_p).total_seconds()/60
-                    if ot_val and ot_val > 0:
-                        expected_min = ot_val*60
-                        if abs(actual_min - expected_min) <= 30:
-                            status="Match"
-                        else:
-                            status="OT Deviation"
-                    else:
-                        if (s["in_start"]<=in_p.time()<=s["in_end"]) and (s["out_start"]<=out_p.time()<=s["out_end"]):
-                            status="Match"
-                        elif in_p.time()>s["in_end"]:
-                            status="Late In Punch"
-                        elif out_p.time()<s["out_start"]:
-                            status="Early"
-                        else:
-                            status="Mismatch"
+                # Earliest IN, Latest OUT near window
+                in_candidates=[p for p in p1 if s["in_start"]<=p.time()<=s["in_end"]]
+                out_candidates=[p for p in p1 if s["out_start"]<=p.time()<=s["out_end"]]
+                in_p=min(in_candidates) if in_candidates else p1[0]
+                out_p=max(out_candidates) if out_candidates else p1[-1]
 
-        # ----- HALF-NIGHT -----
-        elif any(x in shift for x in ["hf","half","hnight","hn"]):
-            s=SHIFT["hn"]
-            punches=(p1 or [])+(p2 or [])
-            in_p = pick_by_window(punches, (s["in_start"], s["in_end"]))
-            out_p = pick_by_window(punches, (s["out_start"], s["out_end"]))
-            if not in_p or not out_p:
-                status="No Punch"
-            else:
                 if out_p < in_p: out_p = out_p + timedelta(days=1)
-                actual_min = (out_p - in_p).total_seconds()/60
-                if ot_val and ot_val > 0:
-                    expected_min = ot_val*60
-                    if abs(actual_min - expected_min) <= 30:
-                        status="Match"
-                    else:
-                        status="OT Deviation"
+
+                if ot_val and ot_val>0:
+                    status="Match"
                 else:
-                    if (s["in_start"]<=in_p.time()<=s["in_end"]) and (s["out_start"]<=out_p.time()<=s["out_end"]):
+                    t_in,t_out=in_p.time(),out_p.time()
+                    if (s["in_start"]<=t_in<=s["in_end"]) and (s["out_start"]<=t_out<=s["out_end"]):
                         status="Match"
-                    elif in_p.time()>s["in_end"]:
+                    elif t_in>s["in_end"]:
                         status="Late In Punch"
-                    elif out_p.time()<s["out_start"]:
+                    elif t_out<s["out_start"]:
                         status="Early"
                     else:
                         status="Mismatch"
+            results.append(status)
+            continue
 
-        # ----- FULL-NIGHT (Cross-Day with Overtime Only When OT Exists) -----
-        elif any(x in shift for x in ["fn", "fullnight", "night"]):
-            s = SHIFT["fn"]
-            in_p = pick_by_window(p1, (s["in_start"], s["in_end"]))
-            out_p = pick_by_window(p2, (s["out_start"], s["out_end"]))
-            if not in_p and not out_p:
-                status = "No Punch"
-            elif in_p and not out_p:
-                status = "Single In Punch"
-            elif not in_p and out_p:
-                status = "Single Out Punch"
-            else:
-                if out_p < in_p: out_p = out_p + timedelta(days=1)
-                t_in, t_out = in_p.time(), out_p.time()
-                if ot_val and ot_val > 0:
-                    actual_min = (out_p - in_p).total_seconds() / 60
-                    expected_min = ot_val * 60
-                    diff = abs(actual_min - expected_min)
-                    if diff <= 30:
-                        status = "Match"
-                    else:
-                        status = "OT Deviation"
-                else:
-                    if (s["in_start"] <= t_in <= s["in_end"]) and (s["out_start"] <= t_out <= s["out_end"]):
-                        status = "Match"
-                    elif t_in > s["in_end"]:
-                        status = "Late In Punch"
-                    elif t_out < s["out_start"]:
-                        status = "Early"
-                    else:
-                        status = "Mismatch"
-
-        # ----- GENERAL-1 -----
-        elif any(x in shift for x in ["general1","general 1"]):
-            s=SHIFT["general1"]
-            in_p = pick_by_window(p1, (s["in_start"], s["in_end"]))
-            out_p = pick_by_window(p1, (s["out_start"], s["out_end"]))
-            if not in_p or not out_p:
-                status="No Punch"
-            else:
-                if out_p < in_p: out_p = out_p + timedelta(days=1)
-                actual_min = (out_p - in_p).total_seconds()/60
-                if ot_val and ot_val > 0:
-                    expected_min = ot_val*60
-                    if abs(actual_min - expected_min) <= 30:
-                        status="Match"
-                    else:
-                        status="OT Deviation"
-                else:
-                    if (s["in_start"]<=in_p.time()<=s["in_end"]) and (s["out_start"]<=out_p.time()<=s["out_end"]):
-                        status="Match"
-                    elif in_p.time()>s["in_end"]:
-                        status="Late In Punch"
-                    elif out_p.time()<s["out_start"]:
-                        status="Early"
-                    else:
-                        status="Mismatch"
-
-        # ----- GENERAL-2 -----
+        # ---------- GENERAL-2 ----------
         elif any(x in shift for x in ["general2","general 2"]):
             s=SHIFT["general2"]
-            in_p = pick_by_window(p1, (s["in_start"], s["in_end"]))
-            out_p = pick_by_window(p1, (s["out_start"], s["out_end"]))
-            if not in_p or not out_p:
+            if not p1:
                 status="No Punch"
+            elif len(p1)==1:
+                t=p1[0].time()
+                status="Single In Punch" if t < s["out_start"] else "Single Out Punch"
+            else:
+                # Earliest IN, Latest OUT near window
+                in_candidates=[p for p in p1 if s["in_start"]<=p.time()<=s["in_end"]]
+                out_candidates=[p for p in p1 if s["out_start"]<=p.time()<=s["out_end"]]
+                in_p=min(in_candidates) if in_candidates else p1[0]
+                out_p=max(out_candidates) if out_candidates else p1[-1]
+
+                if out_p < in_p: out_p = out_p + timedelta(days=1)
+
+                if ot_val and ot_val>0:
+                    status="Match"
+                else:
+                    t_in,t_out=in_p.time(),out_p.time()
+                    if (s["in_start"]<=t_in<=s["in_end"]) and (s["out_start"]<=t_out<=s["out_end"]):
+                        status="Match"
+                    elif t_in>s["in_end"]:
+                        status="Late In Punch"
+                    elif t_out<s["out_start"]:
+                        status="Early"
+                    else:
+                        status="Mismatch"
+            results.append(status)
+            continue
+
+        # ---------- FULL-NIGHT ----------
+        elif any(x in shift for x in ["fn","fullnight","night"]):
+            s = SHIFT["fn"]
+            valid_in=[p for p in p1 if s["in_start"]<=p.time()<=s["in_end"]]
+            valid_out=[p for p in p2 if s["out_start"]<=p.time()<=s["out_end"]]
+            in_p = valid_in[0] if valid_in else (p1[1] if len(p1)>=2 else p1[0] if p1 else None)
+            out_p = valid_out[0] if valid_out else (p2[0] if p2 else None)
+
+            if not in_p and not out_p:
+                status="No Punch"
+            elif in_p and not out_p:
+                status="Single In Punch"
+            elif not in_p and out_p:
+                status="Single Out Punch"
             else:
                 if out_p < in_p: out_p = out_p + timedelta(days=1)
-                actual_min = (out_p - in_p).total_seconds()/60
-                if ot_val and ot_val > 0:
-                    expected_min = ot_val*60
-                    if abs(actual_min - expected_min) <= 30:
+                if ot_val and ot_val>0:
+                    actual_min=(out_p - in_p).total_seconds()/60
+                    expected_min=ot_val*60
+                    if abs(actual_min-expected_min)<=30:
                         status="Match"
                     else:
                         status="OT Deviation"
                 else:
-                    if (s["in_start"]<=in_p.time()<=s["in_end"]) and (s["out_start"]<=out_p.time()<=s["out_end"]):
+                    t_in,t_out=in_p.time(),out_p.time()
+                    if (s["in_start"]<=t_in<=s["in_end"]) and (s["out_start"]<=t_out<=s["out_end"]):
                         status="Match"
-                    elif in_p.time()>s["in_end"]:
+                    elif t_in>s["in_end"]:
                         status="Late In Punch"
-                    elif out_p.time()<s["out_start"]:
+                    elif t_out<s["out_start"]:
                         status="Early"
                     else:
                         status="Mismatch"
+            results.append(status)
+            continue
 
         else:
             status="No Punch"
-
-        results.append(status)
+            results.append(status)
 
     att_df["Status"]=results
 
@@ -289,15 +240,17 @@ def compare_files(att_bytes,bio1_bytes,bio2_bytes=None):
     return out,att_df
 
 # ---------- Streamlit ----------
-st.set_page_config(page_title="Attendance Comparator (Smart OT Logic)",page_icon="🕒",layout="centered")
-st.title("🕒 Attendance Comparator — All Shifts with Smart Overtime Logic")
+st.set_page_config(page_title="Attendance Comparator (General 1 & 2 Fixed)",page_icon="🕒",layout="centered")
+st.title("🕒 Attendance Comparator — General-1 & General-2 Fixed Logic")
 st.markdown("""
-✅ **Smart Overtime Logic:**  
-- **OT validation applies only when “Overtime” field > 0.**  
-- Auto-detects IN/OUT punches within shift window.  
-- **Cross-day handling** for Full-Night shift (11:15 PM – 7:15 AM).  
-- ±30-minute tolerance for Overtime comparison.  
-- Works even with one or two biometric files.  
+✅ **Fixed Logic for General-1 (8–4) and General-2 (9–5):**  
+- If **only one punch**,  
+  - before OUT-start → `Single In Punch`  
+  - after OUT-start → `Single Out Punch`.  
+- If **multiple punches**,  
+  - choose earliest valid IN and latest valid OUT in window.  
+- If **Overtime > 0**, automatically `Match`.  
+- Late In & Early Out detection included.  
 """)
 
 att=st.file_uploader("📁 Attendance File",type=["xlsx"])
