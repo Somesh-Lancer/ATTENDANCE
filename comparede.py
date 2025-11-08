@@ -47,12 +47,16 @@ def get_punch_times(df, emp, id_col):
 
 # ---------- Shift Windows ----------
 SHIFT = {
+    "day":       {"in_start": time(6,45), "in_end": time(7,30),
+                  "out_start": time(15,0), "out_end": time(15,45)},
+    "hn":        {"in_start": time(14,45), "in_end": time(15,30),
+                  "out_start": time(23,0),  "out_end": time(23,45)},
+    "fn":        {"in_start": time(23,0),  "in_end": time(23,30),
+                  "out_start": time(6,45),  "out_end": time(7,30)},
     "general1":  {"in_start": time(7,30),  "in_end": time(8,15),
                   "out_start": time(15,30), "out_end": time(16,15)},
     "general2":  {"in_start": time(8,30),  "in_end": time(9,15),
                   "out_start": time(16,30), "out_end": time(17,45)},
-    "fn":        {"in_start": time(23,0),  "in_end": time(23,30),
-                  "out_start": time(6,45),  "out_end": time(7,30)},
 }
 
 # ---------- Core ----------
@@ -73,12 +77,10 @@ def compare_files(att_bytes,bio1_bytes,bio2_bytes=None):
     date_col=next((c for c in att_df.columns if "date" in c.lower()),None)
     if date_col: att_df[date_col]=pd.to_datetime(att_df[date_col],errors="coerce")
 
-    # Biometric File 1 (mandatory)
+    # Biometric Files
     bio1_path = tmpcopy(bio1_bytes)
     bio1 = dedupe(pd.read_excel(bio1_path, skiprows=1))
     bio1.columns = bio1.columns.str.strip()
-
-    # Biometric File 2 (optional)
     bio2=None
     if bio2_bytes:
         bio2_path = tmpcopy(bio2_bytes)
@@ -93,12 +95,11 @@ def compare_files(att_bytes,bio1_bytes,bio2_bytes=None):
     bio1[b_emp1]=bio1[b_emp1].astype(str).map(clean_id)
     if bio2 is not None: bio2[b_emp2]=bio2[b_emp2].astype(str).map(clean_id)
 
-    # Filter to only matching employees
     all_emps=set(bio1[b_emp1])
     if bio2 is not None: all_emps|=set(bio2[b_emp2])
     att_df=att_df[att_df[m_emp].isin(all_emps)].reset_index(drop=True)
 
-    # --- Helpers ---
+    # ---- helpers ----
     def get_ot_hours(row):
         for c in att_df.columns:
             if "overtime" in c.lower():
@@ -119,23 +120,20 @@ def compare_files(att_bytes,bio1_bytes,bio2_bytes=None):
         status="No Punch"
         ot_val=get_ot_hours(row)
 
-        # ---------- GENERAL-1 ----------
-        if any(x in shift for x in ["general1","general 1"]):
-            s=SHIFT["general1"]
+        # ----- DAY -----
+        if "day" in shift:
+            s=SHIFT["day"]
             if not p1:
                 status="No Punch"
             elif len(p1)==1:
                 t=p1[0].time()
                 status="Single In Punch" if t < s["out_start"] else "Single Out Punch"
             else:
-                # Earliest IN, Latest OUT near window
                 in_candidates=[p for p in p1 if s["in_start"]<=p.time()<=s["in_end"]]
                 out_candidates=[p for p in p1 if s["out_start"]<=p.time()<=s["out_end"]]
                 in_p=min(in_candidates) if in_candidates else p1[0]
                 out_p=max(out_candidates) if out_candidates else p1[-1]
-
                 if out_p < in_p: out_p = out_p + timedelta(days=1)
-
                 if ot_val and ot_val>0:
                     status="Match"
                 else:
@@ -151,23 +149,21 @@ def compare_files(att_bytes,bio1_bytes,bio2_bytes=None):
             results.append(status)
             continue
 
-        # ---------- GENERAL-2 ----------
-        elif any(x in shift for x in ["general2","general 2"]):
-            s=SHIFT["general2"]
-            if not p1:
+        # ----- HALF-NIGHT -----
+        if any(x in shift for x in ["hf","half","hnight","hn"]):
+            s=SHIFT["hn"]
+            punches=(p1 or [])+(p2 or [])
+            if not punches:
                 status="No Punch"
-            elif len(p1)==1:
-                t=p1[0].time()
+            elif len(punches)==1:
+                t=punches[0].time()
                 status="Single In Punch" if t < s["out_start"] else "Single Out Punch"
             else:
-                # Earliest IN, Latest OUT near window
-                in_candidates=[p for p in p1 if s["in_start"]<=p.time()<=s["in_end"]]
-                out_candidates=[p for p in p1 if s["out_start"]<=p.time()<=s["out_end"]]
-                in_p=min(in_candidates) if in_candidates else p1[0]
-                out_p=max(out_candidates) if out_candidates else p1[-1]
-
+                in_candidates=[p for p in punches if s["in_start"]<=p.time()<=s["in_end"]]
+                out_candidates=[p for p in punches if s["out_start"]<=p.time()<=s["out_end"]]
+                in_p=min(in_candidates) if in_candidates else punches[0]
+                out_p=max(out_candidates) if out_candidates else punches[-1]
                 if out_p < in_p: out_p = out_p + timedelta(days=1)
-
                 if ot_val and ot_val>0:
                     status="Match"
                 else:
@@ -183,14 +179,13 @@ def compare_files(att_bytes,bio1_bytes,bio2_bytes=None):
             results.append(status)
             continue
 
-        # ---------- FULL-NIGHT ----------
-        elif any(x in shift for x in ["fn","fullnight","night"]):
-            s = SHIFT["fn"]
+        # ----- FULL-NIGHT (Cross-Day with OT only when OT value present) -----
+        if any(x in shift for x in ["fn","fullnight","night"]):
+            s=SHIFT["fn"]
             valid_in=[p for p in p1 if s["in_start"]<=p.time()<=s["in_end"]]
             valid_out=[p for p in p2 if s["out_start"]<=p.time()<=s["out_end"]]
-            in_p = valid_in[0] if valid_in else (p1[1] if len(p1)>=2 else p1[0] if p1 else None)
-            out_p = valid_out[0] if valid_out else (p2[0] if p2 else None)
-
+            in_p=valid_in[0] if valid_in else (p1[1] if len(p1)>=2 else p1[0] if p1 else None)
+            out_p=valid_out[0] if valid_out else (p2[0] if p2 else None)
             if not in_p and not out_p:
                 status="No Punch"
             elif in_p and not out_p:
@@ -219,9 +214,65 @@ def compare_files(att_bytes,bio1_bytes,bio2_bytes=None):
             results.append(status)
             continue
 
-        else:
-            status="No Punch"
+        # ----- GENERAL-1 -----
+        if any(x in shift for x in ["general1","general 1"]):
+            s=SHIFT["general1"]
+            if not p1:
+                status="No Punch"
+            elif len(p1)==1:
+                t=p1[0].time()
+                status="Single In Punch" if t < s["out_start"] else "Single Out Punch"
+            else:
+                in_candidates=[p for p in p1 if s["in_start"]<=p.time()<=s["in_end"]]
+                out_candidates=[p for p in p1 if s["out_start"]<=p.time()<=s["out_end"]]
+                in_p=min(in_candidates) if in_candidates else p1[0]
+                out_p=max(out_candidates) if out_candidates else p1[-1]
+                if out_p < in_p: out_p = out_p + timedelta(days=1)
+                if ot_val and ot_val>0:
+                    status="Match"
+                else:
+                    t_in,t_out=in_p.time(),out_p.time()
+                    if (s["in_start"]<=t_in<=s["in_end"]) and (s["out_start"]<=t_out<=s["out_end"]):
+                        status="Match"
+                    elif t_in>s["in_end"]:
+                        status="Late In Punch"
+                    elif t_out<s["out_start"]:
+                        status="Early"
+                    else:
+                        status="Mismatch"
             results.append(status)
+            continue
+
+        # ----- GENERAL-2 -----
+        if any(x in shift for x in ["general2","general 2"]):
+            s=SHIFT["general2"]
+            if not p1:
+                status="No Punch"
+            elif len(p1)==1:
+                t=p1[0].time()
+                status="Single In Punch" if t < s["out_start"] else "Single Out Punch"
+            else:
+                in_candidates=[p for p in p1 if s["in_start"]<=p.time()<=s["in_end"]]
+                out_candidates=[p for p in p1 if s["out_start"]<=p.time()<=s["out_end"]]
+                in_p=min(in_candidates) if in_candidates else p1[0]
+                out_p=max(out_candidates) if out_candidates else p1[-1]
+                if out_p < in_p: out_p = out_p + timedelta(days=1)
+                if ot_val and ot_val>0:
+                    status="Match"
+                else:
+                    t_in,t_out=in_p.time(),out_p.time()
+                    if (s["in_start"]<=t_in<=s["in_end"]) and (s["out_start"]<=t_out<=s["out_end"]):
+                        status="Match"
+                    elif t_in>s["in_end"]:
+                        status="Late In Punch"
+                    elif t_out<s["out_start"]:
+                        status="Early"
+                    else:
+                        status="Mismatch"
+            results.append(status)
+            continue
+
+        results.append("No Punch")
 
     att_df["Status"]=results
 
@@ -240,17 +291,15 @@ def compare_files(att_bytes,bio1_bytes,bio2_bytes=None):
     return out,att_df
 
 # ---------- Streamlit ----------
-st.set_page_config(page_title="Attendance Comparator (General 1 & 2 Fixed)",page_icon="🕒",layout="centered")
-st.title("🕒 Attendance Comparator — General-1 & General-2 Fixed Logic")
+st.set_page_config(page_title="Attendance Comparator (All Shifts Unified)",page_icon="🕒",layout="centered")
+st.title("🕒 Attendance Comparator — Unified Logic for All Shifts")
 st.markdown("""
-✅ **Fixed Logic for General-1 (8–4) and General-2 (9–5):**  
-- If **only one punch**,  
-  - before OUT-start → `Single In Punch`  
-  - after OUT-start → `Single Out Punch`.  
-- If **multiple punches**,  
-  - choose earliest valid IN and latest valid OUT in window.  
-- If **Overtime > 0**, automatically `Match`.  
-- Late In & Early Out detection included.  
+✅ **Unified Logic Implemented:**  
+- **Day, Half-Night, Full-Night, General-1, General-2** handled.  
+- Smart selection: **Earliest valid IN + Latest valid OUT**.  
+- Single punches correctly classified as *Single In/Out*.  
+- Overtime only applied if field > 0 (±30 mins tolerance).  
+- Full-Night cross-day logic built in.  
 """)
 
 att=st.file_uploader("📁 Attendance File",type=["xlsx"])
