@@ -24,7 +24,8 @@ def to_time(v):
 
 def find_emp_col(df):
     for c in df.columns:
-        if any(k in str(c).lower() for k in ["pay code","emp code","empid","emp id","employee code","code"]):
+        if any(k in str(c).lower() for k in
+               ["pay code","emp code","empid","emp id","employee code","code"]):
             return c
     return df.columns[0]
 
@@ -78,13 +79,14 @@ def compare_files(att_bytes,bio1_bytes,bio2_bytes=None):
     # Attendance
     att_path = tmpcopy(att_bytes)
     xls=pd.ExcelFile(att_path)
-    sheet=next((s for s in xls.sheet_names if "data" in s.lower() and "entry" in s.lower()), xls.sheet_names[0])
+    sheet=next((s for s in xls.sheet_names if "data" in s.lower() and "entry" in s.lower()),
+               xls.sheet_names[0])
     att_df=pd.read_excel(att_path,sheet_name=sheet)
     att_df.columns=att_df.columns.str.strip()
     date_col=next((c for c in att_df.columns if "date" in c.lower()),None)
     if date_col: att_df[date_col]=pd.to_datetime(att_df[date_col],errors="coerce")
 
-    # Biometric files
+    # Biometric Files
     bio1_path = tmpcopy(bio1_bytes)
     bio1 = dedupe(pd.read_excel(bio1_path, skiprows=1))
     bio1.columns = bio1.columns.str.strip()
@@ -104,7 +106,7 @@ def compare_files(att_bytes,bio1_bytes,bio2_bytes=None):
 
     emps_b1=set(bio1[b_emp1])
     emps_b2=set(bio2[b_emp2]) if bio2 is not None else set()
-    all_emps = emps_b1 | emps_b2  # keep all attendance rows; we’ll mark No Punch if missing
+    all_emps = emps_b1 | emps_b2  # keep all attendance rows; mark No Punch if missing
 
     # ---- helpers ----
     def get_ot_hours(row):
@@ -138,9 +140,7 @@ def compare_files(att_bytes,bio1_bytes,bio2_bytes=None):
     def compute_duration_minutes(in_p, out_p):
         if not in_p or not out_p:
             return None
-        end = out_p
-        if out_p < in_p:
-            end = out_p + timedelta(days=1)
+        end = out_p + (timedelta(days=1) if out_p < in_p else timedelta(0))
         return (end - in_p).total_seconds() / 60
 
     results=[]
@@ -167,41 +167,52 @@ def compare_files(att_bytes,bio1_bytes,bio2_bytes=None):
             results.append("No Punch"); in_times.append(""); out_times.append(""); work_hrs.append(""); remark.append("")
             continue
 
-        # ---- DAY / GENERAL-1 / GENERAL-2 use same-day logic with robust OUT pick ----
+        # ---- same-day shift handler (Day / G1 / G2) ----
         def handle_same_day(punches, s):
             nonlocal status, in_time_str, out_time_str, whr_str, rem_str
             if not punches:
                 status="No Punch"; return
-            # If only in-window cluster and no after-out punches → Single In Punch but still show last IN
+
+            # Single punch: decide by out_start; DO NOT set both columns
+            if len(punches) == 1:
+                t = punches[0].time()
+                if t < s["out_start"]:
+                    status="Single In Punch"; in_time_str=punches[0].strftime("%H:%M")
+                else:
+                    status="Single Out Punch"; out_time_str=punches[0].strftime("%H:%M")
+                return
+
+            # Cluster rules and robust picks
+            in_win  = [p for p in punches if s["in_start"]<=p.time()<=s["in_end"]]
+            out_win = [p for p in punches if s["out_start"]<=p.time()<=s["out_end"]]
+            if len(punches)>1 and in_win and not out_win:
+                status="Single In Punch"; in_time_str=max(in_win).strftime("%H:%M"); return
+            if len(punches)>1 and out_win and not in_win:
+                status="Single Out Punch"; out_time_str=max(out_win).strftime("%H:%M"); return
+
             in_p, out_p = pick_in_out_same_day(punches, s)
-            if not out_p and in_p:
-                status="Single In Punch"; in_time_str=in_p.strftime("%H:%M"); out_time_str=""
-                return
-            if not in_p and out_p:
-                status="Single Out Punch"; in_time_str=""; out_time_str=out_p.strftime("%H:%M")
-                return
-            if not in_p and not out_p:
-                status="No Punch"; return
+            if in_p:  in_time_str  = in_p.strftime("%H:%M")
+            if out_p: out_time_str = out_p.strftime("%H:%M")
 
-            # Compute duration & display
-            in_time_str = in_p.strftime("%H:%M")
-            out_time_str = out_p.strftime("%H:%M")
+            if not out_p:
+                status="Single In Punch"; return
+            if not in_p:
+                status="Single Out Punch"; return
+
             dur_min = compute_duration_minutes(in_p, out_p)
-            whr_str = fmt_hhmm(dur_min) if dur_min is not None else ""
+            if dur_min is not None: whr_str = fmt_hhmm(dur_min)
 
-            # If OT is provided, use OT rule (±30 min) and don't use Below 8 Hrs
+            # OT overrides normal status (±30 min)
             if ot_val and ot_val > 0:
-                expected_min = ot_val*60
-                status = "Match" if abs(dur_min-expected_min) <= 30 else "OT Deviation"
+                expected = ot_val*60
+                status = "Match" if abs(dur_min-expected) <= 30 else "OT Deviation"
                 return
 
-            # Below 8 hours rule (independent of windows)
+            # Below 8 hours rule
             if dur_min is not None and dur_min < 480:
-                status = "Below 8 Hrs"
-                rem_str = "BELOW 8HRS"
-                return
+                status="Below 8 Hrs"; rem_str="BELOW 8HRS"; return
 
-            # If not OT and not <8h, then evaluate windows for status
+            # Window-based status
             t_in, t_out = in_p.time(), out_p.time()
             if (s["in_start"]<=t_in<=s["in_end"]) and (s["out_start"]<=t_out<=s["out_end"]):
                 status="Match"
@@ -224,29 +235,32 @@ def compare_files(att_bytes,bio1_bytes,bio2_bytes=None):
         elif any(x in shift for x in ["general2","general 2"]):
             handle_same_day(p1, SHIFT["general2"])
 
-        # ----- HALF-NIGHT -----
+        # ----- HALF-NIGHT (combine files) -----
         elif any(x in shift for x in ["hf","half","hnight","hn"]):
             s=SHIFT["hn"]
             punches=(p1 or [])+(p2 or [])
             if not punches:
                 status="No Punch"
-            else:
-                # For HN we’ll still compute duration when both exist
-                # IN = latest inside IN window or last before out-start; OUT = last >= out-start
-                in_p, out_p = pick_in_out_same_day(punches, s)
-                if not out_p and in_p:
-                    status="Single In Punch"; in_time_str=in_p.strftime("%H:%M")
-                elif not in_p and out_p:
-                    status="Single Out Punch"; out_time_str=out_p.strftime("%H:%M")
-                elif not in_p and not out_p:
-                    status="No Punch"
+            elif len(punches)==1:
+                t=punches[0].time()
+                if t < s["out_start"]:
+                    status="Single In Punch"; in_time_str=punches[0].strftime("%H:%M")
                 else:
-                    in_time_str=in_p.strftime("%H:%M"); out_time_str=out_p.strftime("%H:%M")
+                    status="Single Out Punch"; out_time_str=punches[0].strftime("%H:%M")
+            else:
+                in_p, out_p = pick_in_out_same_day(punches, s)
+                if in_p:  in_time_str  = in_p.strftime("%H:%M")
+                if out_p: out_time_str = out_p.strftime("%H:%M")
+                if not out_p:
+                    status="Single In Punch"
+                elif not in_p:
+                    status="Single Out Punch"
+                else:
                     dur_min = compute_duration_minutes(in_p, out_p)
-                    whr_str = fmt_hhmm(dur_min) if dur_min is not None else ""
+                    if dur_min is not None: whr_str = fmt_hhmm(dur_min)
                     if ot_val and ot_val>0:
-                        expected_min=ot_val*60
-                        status="Match" if abs(dur_min-expected_min)<=30 else "OT Deviation"
+                        expected=ot_val*60
+                        status="Match" if abs(dur_min-expected)<=30 else "OT Deviation"
                     else:
                         if dur_min is not None and dur_min < 480:
                             status="Below 8 Hrs"; rem_str="BELOW 8HRS"
@@ -264,7 +278,6 @@ def compare_files(att_bytes,bio1_bytes,bio2_bytes=None):
         # ----- FULL-NIGHT (cross-day) -----
         elif any(x in shift for x in ["fn","fullnight","night"]):
             s=SHIFT["fn"]
-            # Prefer punches inside windows
             in_win=[p for p in p1 if s["in_start"]<=p.time()<=s["in_end"]]
             out_win=[p for p in p2 if s["out_start"]<=p.time()<=s["out_end"]]
             in_p = max(in_win) if in_win else (p1[-1] if p1 else None)
@@ -280,10 +293,10 @@ def compare_files(att_bytes,bio1_bytes,bio2_bytes=None):
                 if out_p < in_p: out_p = out_p + timedelta(days=1)
                 in_time_str=in_p.strftime("%H:%M"); out_time_str=out_p.strftime("%H:%M")
                 dur_min = compute_duration_minutes(in_p, out_p)
-                whr_str = fmt_hhmm(dur_min) if dur_min is not None else ""
+                if dur_min is not None: whr_str = fmt_hhmm(dur_min)
                 if ot_val and ot_val>0:
-                    expected_min=ot_val*60
-                    status="Match" if abs(dur_min-expected_min)<=30 else "OT Deviation"
+                    expected=ot_val*60
+                    status="Match" if abs(dur_min-expected)<=30 else "OT Deviation"
                 else:
                     t_in,t_out=in_p.time(),out_p.time()
                     if (s["in_start"]<=t_in<=s["in_end"]) and (s["out_start"]<=t_out<=s["out_end"]):
@@ -294,7 +307,6 @@ def compare_files(att_bytes,bio1_bytes,bio2_bytes=None):
                         status="Early"
                     else:
                         status="Mismatch"
-
         else:
             status="No Punch"
 
@@ -305,11 +317,11 @@ def compare_files(att_bytes,bio1_bytes,bio2_bytes=None):
         remark.append(rem_str)
 
     # append columns
-    att_df["Status"] = results
-    att_df["In Time"] = in_times
+    att_df["Status"]   = results
+    att_df["In Time"]  = in_times
     att_df["Out Time"] = out_times
     att_df["Work Hrs"] = work_hrs
-    att_df["Remark"] = remark
+    att_df["Remark"]   = remark
 
     # ---------- Output ----------
     out=BytesIO()
@@ -332,15 +344,16 @@ def compare_files(att_bytes,bio1_bytes,bio2_bytes=None):
     return out,att_df
 
 # ---------- Streamlit ----------
-st.set_page_config(page_title="Attendance Comparator (Fixed Duration + In/Out)",page_icon="🕒",layout="centered")
-st.title("🕒 Attendance Comparator — Fixed IN/OUT, Duration & Below-8Hrs")
+st.set_page_config(page_title="Attendance Comparator (Latest IN fix)",page_icon="🕒",layout="centered")
+st.title("🕒 Attendance Comparator — Latest IN/OUT Fix + Duration + Below-8Hrs")
 st.markdown("""
-**What’s fixed now**
-- Picks **latest** valid IN inside window and **last** punch after OUT-start → Out Time never missed (e.g., 16:21).
-- Computes **Work Hrs** = Out − In and shows it as **HH:MM**.
-- If Work Hrs **< 8:00**, sets status to **Below 8 Hrs** (and Remark = BELOW 8HRS).
-- OT still applies only if Attendance OT > 0 (±30 min tolerance).
-- Date column is formatted and widened (no more #####).
+**Fixes included**
+- For **single punch**, only **one** of the columns is set:  
+  • before OUT-start → **Single In Punch** (In Time filled)  
+  • at/after OUT-start → **Single Out Punch** (Out Time filled)  
+- For **multiple IN punches**, we pick the **latest** one (not earliest).  
+- Out Time is the **last punch after OUT-start** (never missed).  
+- Duration always computed when both IN and OUT exist, with **Below 8 Hrs** rule.
 """)
 
 att=st.file_uploader("📁 Attendance File",type=["xlsx"])
