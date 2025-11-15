@@ -28,8 +28,8 @@ def to_time(v):
 
 def find_emp_col(df):
     for c in df.columns:
-        if any(k in str(c).lower() for k in 
-               ["pay code","emp code","empid","emp id","employee","code"]):
+        if any(k in str(c).lower() for k in
+               ["pay code", "emp code", "empid", "emp id", "employee", "code"]):
             return c
     return df.columns[0]
 
@@ -85,13 +85,21 @@ SHIFT = {
     },
 }
 
+# Fixed OUT cutoff times per shift
+CUT = {
+    "day": time(15,15),       # 3:15 PM
+    "hn": time(23,15),        # 11:15 PM
+    "fn": time(7,15),         # 7:15 AM
+    "general1": time(16,0),   # 4:00 PM
+    "general2": time(17,0)    # 5:00 PM
+}
+
 # ============================================================
 #                     MAIN COMPARISON LOGIC
 # ============================================================
 
 def compare_files(att_bytes, bio1_bytes, bio2_bytes=None):
 
-    # copy fix
     def tmpcopy(b):
         with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as f:
             f.write(b); f.flush()
@@ -104,7 +112,7 @@ def compare_files(att_bytes, bio1_bytes, bio2_bytes=None):
     att_path = tmpcopy(att_bytes)
     xls = pd.ExcelFile(att_path)
 
-    sheet = next((s for s in xls.sheet_names 
+    sheet = next((s for s in xls.sheet_names
                   if "data" in s.lower() and "entry" in s.lower()),
                  xls.sheet_names[0])
 
@@ -157,7 +165,7 @@ def compare_files(att_bytes, bio1_bytes, bio2_bytes=None):
     def duration(in_p, out_p):
         if in_p is None or out_p is None:
             return None
-        # cross midnight
+        # cross midnight adjust
         out_adj = out_p
         if out_p < in_p:
             out_adj = out_p + timedelta(days=1)
@@ -178,36 +186,32 @@ def compare_files(att_bytes, bio1_bytes, bio2_bytes=None):
         out_p = punches[-1]
         return in_p, out_p
 
-    # =====================================================
-    #                PROCESS EMPLOYEES
-    # =====================================================
-
-    statuses = []
-    in_list = []
-    out_list = []
-    hours_list = []
-    remark_list = []
-
+    statuses, in_list, out_list, hours_list, remark_list = [], [], [], [], []
     shiftcol = next((c for c in att.columns if "shift" in c.lower()), "SHIFT")
+
+    # =====================================================
+    #                PROCESS EACH EMPLOYEE
+    # =====================================================
 
     for _, row in att.iterrows():
 
         emp = clean_id(row[emp_att])
         shift = str(row.get(shiftcol, "")).lower()
 
-        # Select shift
+        # Determine shift key
         if "day" in shift:
-            s = SHIFT["day"]
+            s = SHIFT["day"]; sk = "day"
         elif "general1" in shift:
-            s = SHIFT["general1"]
+            s = SHIFT["general1"]; sk = "general1"
         elif "general2" in shift:
-            s = SHIFT["general2"]
-        elif any(x in shift for x in ["hn","half","night"]):
-            s = SHIFT["hn"]
+            s = SHIFT["general2"]; sk = "general2"
+        elif any(x in shift for x in ["hn", "half", "night"]):
+            s = SHIFT["hn"]; sk = "hn"
         else:
-            s = SHIFT["fn"]
+            s = SHIFT["fn"]; sk = "fn"
 
-        # gather punches
+        cutoff = CUT[sk]
+
         punches = []
         if emp in emps_b1:
             punches += get_punch_times(bio1, emp, emp_b1)
@@ -232,55 +236,42 @@ def compare_files(att_bytes, bio1_bytes, bio2_bytes=None):
         # ========== Single Punch ==========
         if len(punches) == 1:
             t = punches[0].time()
-            if t < s["out_start"]:
-                status = "Single In Punch"
-                in_str = punches[0].strftime("%H:%M")
-            else:
+            if t >= cutoff:
                 status = "Single Out Punch"
                 out_str = punches[0].strftime("%H:%M")
+            else:
+                status = "Single In Punch"
+                in_str = punches[0].strftime("%H:%M")
+
             statuses.append(status); in_list.append(in_str); out_list.append(out_str); hours_list.append(""); remark_list.append("")
             continue
 
         # ========== Multiple Punches ==========
         in_p, out_p = pick_same_day(punches, s)
-
         in_str = in_p.strftime("%H:%M")
         out_str = out_p.strftime("%H:%M")
+
         dur = duration(in_p, out_p)
         whr = fmt_hhmm(dur)
 
         # =====================================================
-        # 1) OUT PUNCH LOGIC (highest priority)
+        # NEW OUT-PUNCH LOGIC (before OT)
         # =====================================================
-        if out_p.time() > s["out_end"]:
-            status = "Late Out Punch"
+
+        if out_p.time() < cutoff:
+            status = "Early Out Punch"
             statuses.append(status); in_list.append(in_str); out_list.append(out_str); hours_list.append(whr); remark_list.append("")
             continue
 
         # =====================================================
-        # 2) EARLY OUT
-        # =====================================================
-        if out_p.time() < s["out_start"]:
-            status = "Early"
-            statuses.append(status); in_list.append(in_str); out_list.append(out_str); hours_list.append(whr); remark_list.append("")
-            continue
-
-        # =====================================================
-        # 3) LATE IN
-        # =====================================================
-        if in_p.time() > s["in_end"]:
-            status = "Late In Punch"
-            statuses.append(status); in_list.append(in_str); out_list.append(out_str); hours_list.append(whr); remark_list.append("")
-            continue
-
-        # =====================================================
-        # 4) OVERTIME LOGIC
+        # OT LOGIC (active)
         # =====================================================
         if ot_val > 0:
             expected = 480 + (ot_val * 60)
+
             if dur >= expected:
                 status = "Match"
-            elif dur >= expected - 30:   # your 30 min rule kept
+            elif dur >= expected - 30:
                 status = "Match"
             else:
                 status = "OT Deviation"
@@ -289,7 +280,7 @@ def compare_files(att_bytes, bio1_bytes, bio2_bytes=None):
             continue
 
         # =====================================================
-        # 5) BELOW 8 HOURS (ONLY OT = 0)
+        # Below 8 hours (only when OT=0)
         # =====================================================
         if dur < 480:
             status = "Below 8 Hrs"
@@ -298,7 +289,7 @@ def compare_files(att_bytes, bio1_bytes, bio2_bytes=None):
             continue
 
         # =====================================================
-        # 6) MATCH
+        # Normal Match
         # =====================================================
         status = "Match"
 
@@ -330,7 +321,7 @@ def compare_files(att_bytes, bio1_bytes, bio2_bytes=None):
 #                          STREAMLIT UI
 # ============================================================
 
-st.title("🕒 FINAL Attendance Comparator — OT + Late Out + Below 8 Hrs Logic")
+st.title("🕒 FINAL Attendance Comparator — Shift Cutoff + OT Logic + Early Out + Below 8 Hrs")
 
 att = st.file_uploader("📁 Attendance File", type=["xlsx"])
 bio1 = st.file_uploader("📁 Biometric Day 1", type=["xlsx"])
