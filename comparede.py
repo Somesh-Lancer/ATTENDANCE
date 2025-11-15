@@ -3,7 +3,6 @@ import pandas as pd
 import re, tempfile, shutil
 from datetime import datetime, time, timedelta
 from io import BytesIO
-from openpyxl.utils import get_column_letter
 
 # ============================================================
 #                  UTILITY HELPER FUNCTIONS
@@ -35,7 +34,6 @@ def to_time(v):
         except:
             pass
     return None
-
 
 def find_emp_col(df):
     for c in df.columns:
@@ -76,29 +74,13 @@ def fmt_hhmm(m):
 # ============================================================
 
 SHIFT = {
-    "day": {
-        "in_start": time(6,45), "in_end": time(7,30),
-        "out_start": time(15,0), "out_end": time(15,45)
-    },
-    "hn": {
-        "in_start": time(14,45), "in_end": time(15,30),
-        "out_start": time(23,0), "out_end": time(23,45)
-    },
-    "fn": {
-        "in_start": time(23,0), "in_end": time(23,30),
-        "out_start": time(6,45), "out_end": time(7,30)
-    },
-    "general1": {
-        "in_start": time(7,30), "in_end": time(8,15),
-        "out_start": time(15,30), "out_end": time(16,15)
-    },
-    "general2": {
-        "in_start": time(8,30), "in_end": time(9,15),
-        "out_start": time(16,30), "out_end": time(17,45)
-    },
+    "day":      {"in_start": time(6,45), "in_end": time(7,30), "out_start": time(15,0), "out_end": time(15,45)},
+    "hn":       {"in_start": time(14,45),"in_end": time(15,30),"out_start": time(23,0),"out_end": time(23,45)},
+    "fn":       {"in_start": time(23,0), "in_end": time(23,30),"out_start": time(6,45),"out_end": time(7,30)},
+    "general1": {"in_start": time(7,30), "in_end": time(8,15), "out_start": time(15,30),"out_end": time(16,15)},
+    "general2": {"in_start": time(8,30), "in_end": time(9,15), "out_start": time(16,30),"out_end": time(17,45)}
 }
 
-# Fixed OUT cutoff times per shift
 CUT = {
     "day": time(15,15),
     "hn": time(23,15),
@@ -116,19 +98,16 @@ def compare_files(att_bytes, bio1_bytes, bio2_bytes=None):
     def tmpcopy(b):
         with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as f:
             f.write(b); f.flush()
-            path = f.name
+            p = f.name
         new = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx").name
-        shutil.copy(path, new)
+        shutil.copy(p, new)
         return new
 
-    # ================= READ ATTENDANCE =================
+    # READ ATTENDANCE
     att_path = tmpcopy(att_bytes)
     xls = pd.ExcelFile(att_path)
 
-    sheet = next((s for s in xls.sheet_names
-                  if "data" in s.lower() and "entry" in s.lower()),
-                 xls.sheet_names[0])
-
+    sheet = next((s for s in xls.sheet_names if "data" in s.lower() and "entry" in s.lower()), xls.sheet_names[0])
     att = pd.read_excel(att_path, sheet_name=sheet)
     att.columns = att.columns.str.strip()
 
@@ -136,17 +115,17 @@ def compare_files(att_bytes, bio1_bytes, bio2_bytes=None):
     if date_col:
         att[date_col] = pd.to_datetime(att[date_col], errors="coerce")
 
-    # ================= READ BIOMETRIC FILE 1 =================
+    # READ BIOMETRIC 1
     bio1 = dedupe(pd.read_excel(tmpcopy(bio1_bytes), skiprows=1))
     bio1.columns = bio1.columns.str.strip()
 
-    # ================= READ BIOMETRIC FILE 2 =================
+    # READ BIOMETRIC 2 (OPTIONAL)
     bio2 = None
     if bio2_bytes:
         bio2 = dedupe(pd.read_excel(tmpcopy(bio2_bytes), skiprows=1))
         bio2.columns = bio2.columns.str.strip()
 
-    # ================= NORMALIZE EMPLOYEE IDs =================
+    # NORMALIZE ID
     emp_att = next((c for c in att.columns if "emp id" in c.lower()), "EMP ID")
     emp_b1 = find_emp_col(bio1)
 
@@ -162,19 +141,17 @@ def compare_files(att_bytes, bio1_bytes, bio2_bytes=None):
     emps_b1 = set(bio1[emp_b1])
     emps_b2 = set(bio2[emp_b2]) if bio2 is not None else set()
 
-    # ================= EXTRACT OT =================
+    # EXTRACT OT
     def get_ot(row):
         for c in att.columns:
             if "overtime" in c.lower():
-                v = row.get(c)
-                if pd.notna(v):
-                    try:
-                        return float(v)
-                    except:
-                        return 0.0
-        return 0.0
+                try:
+                    return float(row[c])
+                except:
+                    return 0
+        return 0
 
-    # ================= DURATION =================
+    # DURATION
     def duration(in_p, out_p):
         if in_p is None or out_p is None:
             return None
@@ -183,20 +160,24 @@ def compare_files(att_bytes, bio1_bytes, bio2_bytes=None):
             out_adj = out_p + timedelta(days=1)
         return (out_adj - in_p).total_seconds() / 60
 
+    statuses = []
+    in_list = []
+    out_list = []
+    hours_list = []
+    remark_list = []
 
-    # =====================================================
-    # PROCESS EACH EMPLOYEE
-    # =====================================================
-
-    statuses, in_list, out_list, hours_list, remark_list = [], [], [], [], []
     shiftcol = next((c for c in att.columns if "shift" in c.lower()), "SHIFT")
+
+    # ============================================================
+    # PROCESS EACH EMPLOYEE
+    # ============================================================
 
     for _, row in att.iterrows():
 
         emp = clean_id(row[emp_att])
         shift = str(row.get(shiftcol, "")).lower()
 
-        # FIX SHIFT DETECTION (Hyphens accepted)
+        # FIX SHIFT DETECTION
         if "day" in shift:
             sk = "day"
         elif "general1" in shift or "general-1" in shift:
@@ -211,18 +192,20 @@ def compare_files(att_bytes, bio1_bytes, bio2_bytes=None):
             sk = "fn"
 
         cutoff = CUT[sk]
+        ot_val = get_ot(row)
 
-        # =========================================================
-        # SPECIAL FULL NIGHT SHIFT LOGIC (FN)
-        # =========================================================
-
-        if sk == "fn":
+        # =====================================================
+        # SPECIAL FULL NIGHT LOGIC ONLY IF BIO2 EXISTS
+        # =====================================================
+        if sk == "fn" and bio2 is not None:
 
             punches_1 = get_punch_times(bio1, emp, emp_b1) if emp in emps_b1 else []
-            punches_2 = get_punch_times(bio2, emp, emp_b2) if (bio2 is not None and emp in emps_b2) else []
+            punches_2 = get_punch_times(bio2, emp, emp_b2) if emp in emps_b2 else []
 
+            # no punches
             if not punches_1 and not punches_2:
-                statuses.append("No Punch"); in_list.append(""); out_list.append(""); hours_list.append(""); remark_list.append("")
+                statuses.append("No Punch")
+                in_list.append(""); out_list.append(""); hours_list.append(""); remark_list.append("")
                 continue
 
             in_p = punches_1[-1] if punches_1 else None
@@ -231,27 +214,28 @@ def compare_files(att_bytes, bio1_bytes, bio2_bytes=None):
             in_str = in_p.strftime("%H:%M") if in_p else ""
             out_str = out_p.strftime("%H:%M") if out_p else ""
 
-            # Single punches
+            # single punch cases
             if in_p and not out_p:
-                statuses.append("Single In Punch"); in_list.append(in_str); out_list.append(""); hours_list.append(""); remark_list.append("")
+                statuses.append("Single In Punch")
+                in_list.append(in_str); out_list.append(""); hours_list.append(""); remark_list.append("")
                 continue
 
             if out_p and not in_p:
-                statuses.append("Single Out Punch"); in_list.append(""); out_list.append(out_str); hours_list.append(""); remark_list.append("")
+                statuses.append("Single Out Punch")
+                in_list.append(""); out_list.append(out_str); hours_list.append(""); remark_list.append("")
                 continue
 
-            # Early out
+            # early out
             if out_p.time() < cutoff:
                 dur = duration(in_p, out_p)
                 statuses.append("Early Out Punch")
                 in_list.append(in_str); out_list.append(out_str); hours_list.append(fmt_hhmm(dur)); remark_list.append("")
                 continue
 
+            # OUT OK → run OT logic
             dur = duration(in_p, out_p)
             whr = fmt_hhmm(dur)
-            ot_val = get_ot(row)
 
-            # OT logic
             if ot_val > 0:
                 expected = 480 + ot_val*60
                 if dur >= expected or dur >= expected - 30:
@@ -260,7 +244,8 @@ def compare_files(att_bytes, bio1_bytes, bio2_bytes=None):
                     status = "OT Deviation"
             else:
                 if dur < 480:
-                    statuses.append("Below 8 Hrs")
+                    status = "Below 8 Hrs"
+                    statuses.append(status)
                     in_list.append(in_str); out_list.append(out_str); hours_list.append(whr); remark_list.append("BELOW 8HRS")
                     continue
                 status = "Match"
@@ -269,25 +254,22 @@ def compare_files(att_bytes, bio1_bytes, bio2_bytes=None):
             in_list.append(in_str); out_list.append(out_str); hours_list.append(whr); remark_list.append("")
             continue
 
-
-        # =========================================================
-        # OTHER SHIFTS
-        # =========================================================
+        # =====================================================
+        # DEFAULT LOGIC (ALL SHIFTS + FN when bio2 is missing)
+        # =====================================================
 
         punches = []
         if emp in emps_b1:
             punches += get_punch_times(bio1, emp, emp_b1)
-        if bio2 is not None and emp in emps_b2:
-            punches += get_punch_times(bio2, emp, emp_b2)
-
         punches = sorted(punches)
-        ot_val = get_ot(row)
 
+        # no punch
         if not punches:
-            statuses.append("No Punch"); in_list.append(""); out_list.append(""); hours_list.append(""); remark_list.append("")
+            statuses.append("No Punch")
+            in_list.append(""); out_list.append(""); hours_list.append(""); remark_list.append("")
             continue
 
-        # Single punch
+        # single punch
         if len(punches) == 1:
             t = punches[0].time()
             if t >= cutoff:
@@ -298,15 +280,15 @@ def compare_files(att_bytes, bio1_bytes, bio2_bytes=None):
                 in_list.append(punches[0].strftime("%H:%M")); out_list.append(""); hours_list.append(""); remark_list.append("")
             continue
 
-        # Multi-punch logic
+        # multi punch
         s = SHIFT[sk]
         out_p = punches[-1]
 
-        # Correct IN punch selection
+        # IN punch logic
         in_candidates = [p for p in punches if s["in_start"] <= p.time() <= s["in_end"]]
 
         if in_candidates:
-            in_p = min(in_candidates)  # Earliest within IN window
+            in_p = min(in_candidates)
         else:
             before = [p for p in punches if p.time() < s["out_start"]]
             if before:
@@ -319,7 +301,7 @@ def compare_files(att_bytes, bio1_bytes, bio2_bytes=None):
         dur = duration(in_p, out_p)
         whr = fmt_hhmm(dur)
 
-        # Early out
+        # early out
         if out_p.time() < cutoff:
             statuses.append("Early Out Punch")
             in_list.append(in_str); out_list.append(out_str); hours_list.append(whr); remark_list.append("")
@@ -329,19 +311,21 @@ def compare_files(att_bytes, bio1_bytes, bio2_bytes=None):
         if ot_val > 0:
             expected = 480 + ot_val*60
             if dur >= expected or dur >= expected - 30:
-               status = "Match"
+                status = "Match"
             else:
-               status = "OT Deviation"
+                status = "OT Deviation"
 
             statuses.append(status)
             in_list.append(in_str); out_list.append(out_str); hours_list.append(whr); remark_list.append("")
             continue
 
+        # below 8 hrs
         if dur < 480:
             statuses.append("Below 8 Hrs")
             in_list.append(in_str); out_list.append(out_str); hours_list.append(whr); remark_list.append("BELOW 8HRS")
             continue
 
+        # match
         statuses.append("Match")
         in_list.append(in_str); out_list.append(out_str); hours_list.append(whr); remark_list.append("")
 
@@ -362,21 +346,22 @@ def compare_files(att_bytes, bio1_bytes, bio2_bytes=None):
 
     return out, att
 
+
 # ============================================================
 #                          STREAMLIT UI
 # ============================================================
 
-st.title("🕒 FINAL Attendance Comparator — Updated Fixed Logic")
+st.title("🕒 Attendance Comparator — Supports 1 or 2 Biometric Files")
 
 att = st.file_uploader("📁 Attendance File", type=["xlsx"])
 bio1 = st.file_uploader("📁 Biometric Day 1", type=["xlsx"])
-bio2 = st.file_uploader("📁 Biometric Day 2", type=["xlsx"])
+bio2 = st.file_uploader("📁 Biometric Day 2 (Optional)", type=["xlsx"])
 
 if st.button("🔍 Compare"):
-    if not att or not bio1 or not bio2:
-        st.error("⚠️ Upload attendance + both biometric files")
+    if not att or not bio1:
+        st.error("⚠️ Please upload Attendance + Biometric Day 1")
     else:
-        out, df = compare_files(att.read(), bio1.read(), bio2.read())
+        out, df = compare_files(att.read(), bio1.read(), bio2.read() if bio2 else None)
         st.success("Completed!")
         st.download_button("⬇ Download Result", out, "Attendance_with_Status.xlsx")
         st.dataframe(df)
