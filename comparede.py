@@ -21,7 +21,7 @@ def to_time(v):
 
     s = str(v).strip()
 
-    # Extract only HH:MM or HH:MM:SS
+    # Extract HH:MM or HH:MM:SS
     match = re.search(r"(\d{1,2}:\d{2}(?::\d{2})?)", s)
     if not match:
         return None
@@ -106,7 +106,6 @@ def compare_files(att_bytes, bio1_bytes, bio2_bytes=None):
     # READ ATTENDANCE
     att_path = tmpcopy(att_bytes)
     xls = pd.ExcelFile(att_path)
-
     sheet = next((s for s in xls.sheet_names if "data" in s.lower() and "entry" in s.lower()), xls.sheet_names[0])
     att = pd.read_excel(att_path, sheet_name=sheet)
     att.columns = att.columns.str.strip()
@@ -160,12 +159,7 @@ def compare_files(att_bytes, bio1_bytes, bio2_bytes=None):
             out_adj = out_p + timedelta(days=1)
         return (out_adj - in_p).total_seconds() / 60
 
-    statuses = []
-    in_list = []
-    out_list = []
-    hours_list = []
-    remark_list = []
-
+    statuses, in_list, out_list, hours_list, remark_list = [], [], [], [], []
     shiftcol = next((c for c in att.columns if "shift" in c.lower()), "SHIFT")
 
     # ============================================================
@@ -177,7 +171,7 @@ def compare_files(att_bytes, bio1_bytes, bio2_bytes=None):
         emp = clean_id(row[emp_att])
         shift = str(row.get(shiftcol, "")).lower()
 
-        # FIX SHIFT DETECTION
+        # SHIFT DETECTION
         if "day" in shift:
             sk = "day"
         elif "general1" in shift or "general-1" in shift:
@@ -192,17 +186,18 @@ def compare_files(att_bytes, bio1_bytes, bio2_bytes=None):
             sk = "fn"
 
         cutoff = CUT[sk]
+        out_start = SHIFT[sk]["out_start"]
         ot_val = get_ot(row)
 
         # =====================================================
-        # SPECIAL FULL NIGHT LOGIC ONLY IF BIO2 EXISTS
+        # SPECIAL FULL NIGHT LOGIC (ONLY IF bio2 EXISTS)
         # =====================================================
+
         if sk == "fn" and bio2 is not None:
 
             punches_1 = get_punch_times(bio1, emp, emp_b1) if emp in emps_b1 else []
             punches_2 = get_punch_times(bio2, emp, emp_b2) if emp in emps_b2 else []
 
-            # no punches
             if not punches_1 and not punches_2:
                 statuses.append("No Punch")
                 in_list.append(""); out_list.append(""); hours_list.append(""); remark_list.append("")
@@ -214,7 +209,7 @@ def compare_files(att_bytes, bio1_bytes, bio2_bytes=None):
             in_str = in_p.strftime("%H:%M") if in_p else ""
             out_str = out_p.strftime("%H:%M") if out_p else ""
 
-            # single punch cases
+            # single punches
             if in_p and not out_p:
                 statuses.append("Single In Punch")
                 in_list.append(in_str); out_list.append(""); hours_list.append(""); remark_list.append("")
@@ -232,7 +227,7 @@ def compare_files(att_bytes, bio1_bytes, bio2_bytes=None):
                 in_list.append(in_str); out_list.append(out_str); hours_list.append(fmt_hhmm(dur)); remark_list.append("")
                 continue
 
-            # OUT OK → run OT logic
+            # OUT OK → OT logic
             dur = duration(in_p, out_p)
             whr = fmt_hhmm(dur)
 
@@ -244,8 +239,7 @@ def compare_files(att_bytes, bio1_bytes, bio2_bytes=None):
                     status = "OT Deviation"
             else:
                 if dur < 480:
-                    status = "Below 8 Hrs"
-                    statuses.append(status)
+                    statuses.append("Below 8 Hrs")
                     in_list.append(in_str); out_list.append(out_str); hours_list.append(whr); remark_list.append("BELOW 8HRS")
                     continue
                 status = "Match"
@@ -255,12 +249,13 @@ def compare_files(att_bytes, bio1_bytes, bio2_bytes=None):
             continue
 
         # =====================================================
-        # DEFAULT LOGIC (ALL SHIFTS + FN when bio2 is missing)
+        # DEFAULT LOGIC FOR ALL OTHER SHIFTS
         # =====================================================
 
         punches = []
         if emp in emps_b1:
             punches += get_punch_times(bio1, emp, emp_b1)
+
         punches = sorted(punches)
 
         # no punch
@@ -269,32 +264,42 @@ def compare_files(att_bytes, bio1_bytes, bio2_bytes=None):
             in_list.append(""); out_list.append(""); hours_list.append(""); remark_list.append("")
             continue
 
-        # single punch
+        # =====================================================
+        # CORRECTED SINGLE PUNCH LOGIC
+        # =====================================================
         if len(punches) == 1:
             t = punches[0].time()
-            if t >= cutoff:
+
+            # OUT punch if >= shift OUT-START
+            if t >= out_start:
                 statuses.append("Single Out Punch")
-                in_list.append(""); out_list.append(punches[0].strftime("%H:%M")); hours_list.append(""); remark_list.append("")
+                in_list.append("")
+                out_list.append(punches[0].strftime("%H:%M"))
+                hours_list.append("")
+                remark_list.append("")
             else:
                 statuses.append("Single In Punch")
-                in_list.append(punches[0].strftime("%H:%M")); out_list.append(""); hours_list.append(""); remark_list.append("")
+                in_list.append(punches[0].strftime("%H:%M"))
+                out_list.append("")
+                hours_list.append("")
+                remark_list.append("")
             continue
 
-        # multi punch
+        # =====================================================
+        # MULTIPLE PUNCH LOGIC
+        # =====================================================
+
         s = SHIFT[sk]
         out_p = punches[-1]
 
-        # IN punch logic
+        # IN punch detection
         in_candidates = [p for p in punches if s["in_start"] <= p.time() <= s["in_end"]]
 
         if in_candidates:
             in_p = min(in_candidates)
         else:
             before = [p for p in punches if p.time() < s["out_start"]]
-            if before:
-                in_p = min(before)
-            else:
-                in_p = punches[0]
+            in_p = min(before) if before else punches[0]
 
         in_str = in_p.strftime("%H:%M")
         out_str = out_p.strftime("%H:%M")
@@ -351,7 +356,7 @@ def compare_files(att_bytes, bio1_bytes, bio2_bytes=None):
 #                          STREAMLIT UI
 # ============================================================
 
-st.title("🕒 Attendance Comparator — Supports 1 or 2 Biometric Files")
+st.title("🕒 FINAL Attendance Comparator — All Fixes Applied")
 
 att = st.file_uploader("📁 Attendance File", type=["xlsx"])
 bio1 = st.file_uploader("📁 Biometric Day 1", type=["xlsx"])
